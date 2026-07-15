@@ -1,0 +1,134 @@
+flowchart TD
+
+%% ============================================================
+%% SEBAL Workflow - Landsat 8/9 C2 L2 + ERA5-Land (GEE)
+%% Bastiaanssen et al. (1998), Allen et al. (2007)
+%% ============================================================
+
+subgraph S0["0) พื้นที่ศึกษาและค่าคงที่"
+    A0["กำหนด AOI: Rectangle 102.3-102.8 E, 15.0-15.4 N (แถบพิมาย)<br/>ต้องมีทั้ง hot pixel (ดินเปล่าแห้ง) และ cold pixel (พืชน้ำเพียงพอ)"]
+    A1["ค่าคงที่:<br/>K = 0.41 (von Karman), RHO = 1.15 kg/m3<br/>CP = 1004 J/kg/K, SIG = 5.67e-8<br/>G_A = 9.81, LAMBDA = 2.45e6 J/kg"]
+    A0 --> A1
+end
+
+subgraph S1["1) เตรียมภาพ Landsat C2 L2"]
+    B0["รวม Collection: LANDSAT/LC08 + LC09 C02 T1_L2<br/>filterBounds(AOI), filterDate 2024-01-01 ถึง 2024-03-31<br/>CLOUD_COVER น้อยกว่า 10 เปอร์เซ็นต์"]
+    B1["ฟังก์ชัน prep ต่อภาพ:<br/>Cloud mask จาก QA_PIXEL<br/>(bit 1 dilated cloud, bit 2 cirrus,<br/>bit 3 cloud, bit 4 cloud shadow)"]
+    B2["Scale factor:<br/>SR = DN x 0.0000275 - 0.2<br/>LST = ST_B10 x 0.00341802 + 149.0 (Kelvin)"]
+    B3["เลือกภาพแรกของ collection, clip ด้วย AOI<br/>เก็บวันที่ถ่ายภาพ (system:time_start)"]
+    B0 --> B1 --> B2 --> B3
+end
+
+subgraph S2["2) ดัชนีพืชพรรณ + Albedo + Emissivity"]
+    C0["โหลด DEM: USGS/SRTMGL1_003 (clip AOI)"]
+    C1["NDVI = (SR_B5 - SR_B4) / (SR_B5 + SR_B4)"]
+    C2["SAVI = 1.5 x (NIR - RED) / (0.5 + NIR + RED)<br/>clamp(-1, 0.685)"]
+    C3["LAI = log((0.69 - SAVI) / 0.59) / (-0.91)<br/>clamp(0, 6) กัน log ติดลบ"]
+    C4["Albedo (Silva et al. 2016, OLI):<br/>0.300 B2 + 0.277 B3 + 0.233 B4<br/>+ 0.143 B5 + 0.036 B6 + 0.012 B7<br/>clamp(0.05, 0.6)"]
+    C5["Emissivity: e0 = 0.95 + 0.01 x LAI<br/>ถ้า NDVI น้อยกว่า 0 (น้ำ/หิมะ) ให้ e0 = 0.985"]
+    C0 --> C1 --> C2 --> C3 --> C4 --> C5
+end
+
+subgraph S3["3) Net Radiation (Rn)"]
+    D0["เรขาคณิตดวงอาทิตย์:<br/>doy = วันที่ของปี<br/>dr = 1 + 0.033 cos(2 pi doy / 365)<br/>cosZen = sin(SUN_ELEVATION)"]
+    D1["Atmospheric transmissivity:<br/>tsw = 0.75 + 2e-5 x DEM"]
+    D2["คลื่นสั้นขาเข้า:<br/>Rs_in = 1367 x cosZen x dr x tsw"]
+    D3["ดึงอุณหภูมิอากาศ Ta (temperature_2m, Kelvin)<br/>จาก ERA5-Land HOURLY<br/>ชั่วโมงใกล้เวลาถ่ายภาพที่สุด (+/- 1 ชม.)"]
+    D4["คลื่นยาวขาเข้า:<br/>RL_in = 0.85 x (-ln tsw)^0.09 x SIG x Ta^4"]
+    D5["คลื่นยาวขาออก:<br/>RL_out = e0 x SIG x LST^4"]
+    D6["Rn = (1 - albedo) x Rs_in + RL_in - RL_out<br/>- (1 - e0) x RL_in"]
+    D0 --> D2
+    D1 --> D2
+    D2 --> D6
+    D3 --> D4
+    D4 --> D6
+    D5 --> D6
+end
+
+subgraph S4["4) Soil Heat Flux (G) - Bastiaanssen (2000)"]
+    E0["G = Rn x (Ts - 273.15)/albedo<br/>x (0.0038 albedo + 0.0074 albedo^2)<br/>x (1 - 0.98 NDVI^4)"]
+    E1["แหล่งน้ำ (NDVI น้อยกว่า 0):<br/>G = 0.5 x Rn"]
+    E0 --> E1
+end
+
+subgraph S5["5) เลือก Hot / Cold pixel อัตโนมัติ"]
+    F0["คำนวณ percentile ของ NDVI และ LST ใน AOI<br/>(p5, p10, p90, p95 ที่ scale 90 m)"]
+    F1["COLD pixel: NDVI มากกว่าหรือเท่ากับ p95<br/>(นาข้าว/พืชชุ่มน้ำ) สมมติ H = 0"]
+    F2["HOT pixel: NDVI น้อยกว่าหรือเท่ากับ p10<br/>และ NDVI มากกว่า 0.15 (ไม่ใช่น้ำ)<br/>และ LST มากกว่าหรือเท่ากับ p90<br/>สมมติ LE = 0"]
+    F3["คำนวณค่าเฉลี่ยบน mask:<br/>Ts_cold, Ts_hot, Rn_hot, G_hot"]
+    F0 --> F1
+    F0 --> F2
+    F1 --> F3
+    F2 --> F3
+end
+
+subgraph S6["6) Sensible Heat Flux (H) - Iterative Calibration"]
+    G0["ลมจาก ERA5-Land:<br/>u10 = sqrt(u^2 + v^2)<br/>ยกขึ้น blending height:<br/>u200 = u10 x ln(200/0.03) / ln(10/0.03)"]
+    G1["Roughness length:<br/>z0m = max(0.018 x LAI, 0.001)<br/>z1 = 0.1 m, z2 = 2.0 m"]
+    G2["ค่าเริ่มต้น (สภาวะเป็นกลาง):<br/>ustar = K x u200 / ln(200/z0m)<br/>rah = ln(z2/z1) / (K x ustar)"]
+    G3{"วนซ้ำครบ 6 รอบ<br/>แล้วหรือยัง?"}
+    G4["rah_hot = ค่าเฉลี่ย rah บน hot mask"]
+    G5["Internal calibration:<br/>dT_hot = (Rn_hot - G_hot) x rah_hot / (RHO x CP)<br/>dT_cold = 0<br/>a = dT_hot / (Ts_hot - Ts_cold)<br/>b = -a x Ts_cold"]
+    G6["dT = a x LST + b<br/>H = RHO x CP x dT / rah"]
+    G7["Monin-Obukhov length:<br/>L = -RHO x CP x ustar^3 x LST / (K x G_A x H)"]
+    G8["ฟังก์ชันเสถียรภาพ:<br/>L น้อยกว่า 0 (ไม่เสถียร): psi_m, psi_h จาก<br/>x = (1 - 16 z/L)^0.25<br/>L มากกว่าหรือเท่ากับ 0 (เสถียร): psi = -5 z/L"]
+    G9["ปรับค่าใหม่:<br/>ustar = K x u200 / (ln(200/z0m) - psi_m_200)<br/>rah = (ln(z2/z1) - psi_h_2 + psi_h_0.1) / (K x ustar)<br/>max(1) กัน rah ติดลบ"]
+    G10["ได้ H สุดท้าย (W/m2)"]
+    G0 --> G2
+    G1 --> G2
+    G2 --> G3
+    G3 -- "ยังไม่ครบ" --> G4
+    G4 --> G5 --> G6 --> G7 --> G8 --> G9 --> G3
+    G3 -- "ครบ 6 รอบ" --> G10
+end
+
+subgraph S7["7) LE -> Evaporative Fraction -> ET รายวัน"]
+    H0["Latent Heat Flux:<br/>LE = Rn - G - H (ขั้นต่ำ 0)"]
+    H1["Evaporative Fraction:<br/>EF = LE / (Rn - G), clamp(0, 1)"]
+    H2["รังสีดวงอาทิตย์รายวัน Rs24<br/>จาก ERA5-Land DAILY_AGGR<br/>(surface_solar_radiation_downwards_sum / 86400)"]
+    H3["Rn รายวัน (de Bruin):<br/>Rn24 = (1 - albedo) x Rs24 - 110 x tsw"]
+    H4["ET รายวัน:<br/>ET24 = EF x Rn24 x 86400 / LAMBDA<br/>(mm/day, ขั้นต่ำ 0)"]
+    H0 --> H1
+    H2 --> H3
+    H1 --> H4
+    H3 --> H4
+end
+
+subgraph S8["8) แสดงผล"]
+    I0["Map layers: RGB, NDVI, LST องศา C,<br/>Rn, H, ET24, Hot/Cold pixels"]
+    I1["print ET เฉลี่ยในพื้นที่ (mm/day)<br/>ที่ scale 30 m"]
+    I0 --> I1
+end
+
+%% ---- การไหลหลักระหว่างขั้นตอน ----
+S0 --> S1
+S1 --> S2
+S2 --> S3
+S3 --> S4
+S4 --> S5
+S5 --> S6
+S6 --> S7
+S7 --> S8
+
+%% ---- เส้นข้อมูลสำคัญข้ามขั้นตอน ----
+C3 -. "LAI ใช้คำนวณ z0m" .-> G1
+D6 -. "Rn" .-> E0
+D6 -. "Rn" .-> H0
+E1 -. "G" .-> H0
+G10 -. "H" .-> H0
+F3 -. "Ts_hot, Ts_cold, Rn_hot, G_hot" .-> G5
+D1 -. "tsw" .-> H3
+C4 -. "albedo" .-> H3
+
+%% ---- สไตล์ ----
+classDef input fill:#d5e8d4,stroke:#82b366,color:#000
+classDef calc fill:#dae8fc,stroke:#6c8ebf,color:#000
+classDef anchor fill:#ffe6cc,stroke:#d79b00,color:#000
+classDef loopStep fill:#fff2cc,stroke:#d6b656,color:#000
+classDef result fill:#f8cecc,stroke:#b85450,color:#000
+
+class A0,A1,B0,B1,B2,B3,C0,D3,G0,H2 input
+class C1,C2,C3,C4,C5,D0,D1,D2,D4,D5,D6,E0,E1 calc
+class F0,F1,F2,F3 anchor
+class G1,G2,G3,G4,G5,G6,G7,G8,G9 loopStep
+class G10,H0,H1,H3,H4,I0,I1 result

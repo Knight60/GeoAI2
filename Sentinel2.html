@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<!--
+  ============================================================================
+  Sentinel2.html — Sentinel-2 Cloud-free Median Composite, Thailand 2026
+  ============================================================================
+  แสดงภาพ Sentinel-2 SR (median ปลอดเมฆ ด้วย Cloud Score+) ทั้งปี 2026
+  เฉพาะขอบเขตประเทศไทย ซ้อนบนพื้นหลัง Google Satellite
+  ประมวลผลสดบน Google Earth Engine ผ่าน JavaScript API (ต้อง Sign in)
+
+  ขั้นตอนเตรียมการ (ทำครั้งเดียว):
+  1. ไปที่ Google Cloud Console > โปรเจกต์ ee-dancingriver2
+     > APIs & Services > Credentials > Create Credentials
+     > OAuth client ID > Application type: "Web application"
+  2. ใน "Authorized JavaScript origins" เพิ่ม:  http://localhost:8000
+  3. นำ Client ID ที่ได้ (ลงท้าย .apps.googleusercontent.com)
+     มาใส่ในค่า CLIENT_ID ด้านล่าง (ในบล็อก CONFIG)
+
+  วิธีเปิดใช้งาน (OAuth ใช้กับ file:// ไม่ได้ ต้องรันผ่าน local server):
+     cd d:\GeoAI
+     python -m http.server 8000
+  แล้วเปิด  http://localhost:8000/Sentinel2.html  กดปุ่ม Sign in with Google
+  ============================================================================
+-->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sentinel-2 Median — Thailand 2026</title>
+
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://ajax.googleapis.com/ajax/libs/earthengine/0.1.419/earthengine-api.min.js"></script>
+
+<style>
+  html, body { height: 100%; margin: 0; }
+  #map { position: absolute; inset: 0; }
+
+  #panel {
+    position: absolute; top: 12px; left: 60px; z-index: 1000;
+    max-width: 380px; padding: 12px 16px;
+    background: rgba(255, 255, 255, 0.94); border-radius: 10px;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
+    font-family: "Segoe UI", Tahoma, sans-serif; font-size: 14px; color: #222;
+  }
+  #panel h1 { margin: 0 0 4px; font-size: 16px; }
+  #panel .sub { color: #555; font-size: 12.5px; margin: 0 0 8px; }
+  #status { font-size: 13px; color: #0b5394; min-height: 18px; }
+  #status.error { color: #b00020; white-space: pre-wrap; }
+
+  #signin {
+    display: none; margin-top: 8px; padding: 8px 14px; cursor: pointer;
+    font-size: 14px; font-weight: 600; color: #fff;
+    background: #1a73e8; border: none; border-radius: 6px;
+  }
+  #signin:hover { background: #1765cc; }
+
+  #opacityRow { display: none; margin-top: 10px; align-items: center; gap: 8px; }
+  #opacityRow label { font-size: 12.5px; color: #333; white-space: nowrap; }
+  #opacityRow input { flex: 1; }
+
+  .spinner {
+    display: none; width: 14px; height: 14px; vertical-align: -2px;
+    margin-right: 6px; border: 2px solid #c5d9f1; border-top-color: #1a73e8;
+    border-radius: 50%; animation: spin 0.9s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+
+<div id="map"></div>
+
+<div id="panel">
+  <h1>Sentinel-2 Cloud-free Median — Thailand 2026</h1>
+  <p class="sub">
+    COPERNICUS/S2_SR_HARMONIZED · 1 ม.ค. – 31 ธ.ค. 2026 · mask เมฆด้วย Cloud Score+
+    (ภาพครอบคลุมเฉพาะช่วงที่ดาวเทียมถ่ายแล้วจนถึงปัจจุบัน)
+  </p>
+  <div id="status"><span class="spinner" id="spin"></span><span id="statusText">กำลังโหลดไลบรารี…</span></div>
+  <button id="signin">Sign in with Google</button>
+  <div id="opacityRow">
+    <label for="opacity">ความทึบชั้น Sentinel-2</label>
+    <input type="range" id="opacity" min="0" max="100" value="100">
+    <span id="opacityVal">100%</span>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+/* ============================== CONFIG ==================================== */
+const CLIENT_ID  = "YOUR_CLIENT_ID.apps.googleusercontent.com"; // <-- ใส่ OAuth Web Client ID ของคุณ
+const EE_PROJECT = "ee-dancingriver2";                          // Cloud Project ที่ลงทะเบียน Earth Engine
+const YEAR_START = "2026-01-01";
+const YEAR_END   = "2027-01-01";   // exclusive
+const CS_PLUS_THRESHOLD = 0.6;     // cs_cdf >= ค่านี้ = พิกเซลปลอดเมฆ (0.5–0.65 คือช่วงแนะนำ)
+/* ========================================================================== */
+
+/* ---------- แผนที่พื้นหลัง Google Satellite (Leaflet) ---------- */
+const map = L.map("map", { center: [13.0, 101.0], zoom: 6, zoomControl: true });
+
+const gSatellite = L.tileLayer("https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}", {
+  maxZoom: 20, attribution: "Imagery © Google"
+}).addTo(map);
+
+const gHybrid = L.tileLayer("https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}", {
+  maxZoom: 20, attribution: "Imagery © Google"
+});
+
+const layerControl = L.control.layers(
+  { "Google Satellite": gSatellite, "Google Hybrid (มีป้ายชื่อ)": gHybrid },
+  {}, { collapsed: false, position: "topright" }
+).addTo(map);
+
+/* ---------- ส่วนแสดงสถานะ ---------- */
+const statusText = document.getElementById("statusText");
+const statusBox  = document.getElementById("status");
+const spinner    = document.getElementById("spin");
+const signinBtn  = document.getElementById("signin");
+
+function setStatus(msg, opts) {
+  opts = opts || {};
+  statusText.textContent = msg;
+  statusBox.classList.toggle("error", !!opts.error);
+  spinner.style.display = opts.busy ? "inline-block" : "none";
+}
+
+function onError(err) {
+  console.error("Earth Engine error:", err);
+  setStatus("เกิดข้อผิดพลาด: " + (err && err.message ? err.message : err), { error: true });
+}
+
+/* ---------- Auth flow ---------- */
+function startAuth() {
+  if (CLIENT_ID.indexOf("YOUR_CLIENT_ID") === 0) {
+    setStatus("ยังไม่ได้ตั้งค่า CLIENT_ID — เปิดไฟล์นี้แล้วใส่ OAuth Web Client ID ในบล็อก CONFIG ก่อน", { error: true });
+    return;
+  }
+  setStatus("กำลังตรวจสอบการยืนยันตัวตน…", { busy: true });
+  ee.data.authenticateViaOauth(
+    CLIENT_ID,
+    initializeEE,          // เคยอนุญาตแล้ว — เข้าได้เงียบ ๆ
+    onError,
+    null,
+    function () {          // ยังไม่เคยอนุญาต — ให้ผู้ใช้กดปุ่มเพื่อเปิด popup (ป้องกัน popup blocker)
+      setStatus("กรุณา Sign in ด้วยบัญชี Google ที่ลงทะเบียน Earth Engine");
+      signinBtn.style.display = "inline-block";
+    }
+  );
+}
+
+signinBtn.addEventListener("click", function () {
+  signinBtn.style.display = "none";
+  setStatus("กำลัง Sign in…", { busy: true });
+  ee.data.authenticateViaPopup(initializeEE, onError);
+});
+
+function initializeEE() {
+  setStatus("กำลังเชื่อมต่อ Earth Engine…", { busy: true });
+  ee.initialize(null, null, runAnalysis, onError, null, EE_PROJECT);
+}
+
+/* ---------- ตรรกะ GEE: median composite ปลอดเมฆ ปี 2026 เฉพาะประเทศไทย ---------- */
+function runAnalysis() {
+  setStatus("กำลังสร้าง median composite บน Earth Engine…", { busy: true });
+
+  const thailand = ee.FeatureCollection("FAO/GAUL_SIMPLIFIED_500m/2015/level0")
+    .filter(ee.Filter.eq("ADM0_NAME", "Thailand"));
+
+  const csPlus = ee.ImageCollection("GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED");
+
+  const median = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+    .filterDate(YEAR_START, YEAR_END)
+    .filterBounds(thailand.geometry())
+    .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 60))
+    .linkCollection(csPlus, ["cs_cdf"])
+    .map(function (img) {
+      return img.updateMask(img.select("cs_cdf").gte(CS_PLUS_THRESHOLD));
+    })
+    .median()
+    .clip(thailand);
+
+  const vis = { bands: ["B4", "B3", "B2"], min: 0, max: 3000, gamma: 1.2 }; // True color
+
+  median.getMap(vis, function (mapId, error) {
+    if (error || !mapId) { onError(error || "ไม่สามารถสร้างชั้นแผนที่ได้"); return; }
+
+    const s2Layer = L.tileLayer(mapId.urlFormat, {
+      maxZoom: 20,
+      attribution: "Sentinel-2 © ESA / processed in Google Earth Engine"
+    }).addTo(map);
+    layerControl.addOverlay(s2Layer, "Sentinel-2 Median 2026");
+
+    setStatus("พร้อมใช้งาน — tile ประมวลผลสดขณะเลื่อน/ซูม อาจใช้เวลาโหลดสักครู่");
+    setupOpacitySlider(s2Layer);
+  });
+
+  // เส้นขอบประเทศไทย (ดึง geometry แบบ simplified มาวาดฝั่ง client)
+  thailand.geometry().evaluate(function (geojson, error) {
+    if (error || !geojson) { console.warn("โหลดขอบเขตประเทศไม่สำเร็จ:", error); return; }
+    const boundary = L.geoJSON(geojson, {
+      style: { color: "#ffdd00", weight: 2, fill: false }
+    }).addTo(map);
+    layerControl.addOverlay(boundary, "ขอบเขตประเทศไทย");
+    map.fitBounds(boundary.getBounds());
+  });
+}
+
+function setupOpacitySlider(layer) {
+  const row = document.getElementById("opacityRow");
+  const slider = document.getElementById("opacity");
+  const val = document.getElementById("opacityVal");
+  row.style.display = "flex";
+  slider.addEventListener("input", function () {
+    layer.setOpacity(slider.value / 100);
+    val.textContent = slider.value + "%";
+  });
+}
+
+/* ---------- เริ่มทำงานเมื่อโหลดหน้าเสร็จ ---------- */
+window.addEventListener("load", function () {
+  if (typeof ee === "undefined") {
+    setStatus("โหลด Earth Engine API ไม่สำเร็จ — ตรวจสอบการเชื่อมต่ออินเทอร์เน็ต", { error: true });
+    return;
+  }
+  startAuth();
+});
+</script>
+
+</body>
+</html>
